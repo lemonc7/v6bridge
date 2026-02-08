@@ -1,0 +1,7 @@
+example.com:
+  - name: "幻兽帕鲁"
+    remote: 8211
+    local: 8211
+    proto: "udp"
+
+
