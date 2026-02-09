@@ -36,7 +36,8 @@ func TestUDPBridge_Correctness(t *testing.T) {
 	}()
 
 	// 2. 启动转发服务
-	go startUDPBridge(ctx, localAddr, remoteAddr, "test-udp")
+	mgr := NewManager(ctx)
+	go mgr.runUDP(localAddr, remoteAddr, "test-udp")
 	time.Sleep(200 * time.Millisecond) // 等待监听就绪
 
 	// 3. 模拟客户端发送数据到本地端口
@@ -84,8 +85,9 @@ func TestTCPBridge_Correctness(t *testing.T) {
 		_, _ = conn.Write(buf[:n])
 	}()
 
-	// 2. 启动转发
-	go startTCPBridge(ctx, localAddr, remoteAddr, "test-tcp")
+	// 2. 启动转发服务
+	mgr := NewManager(ctx)
+	go mgr.runTCP(localAddr, remoteAddr, "test-tcp")
 	time.Sleep(200 * time.Millisecond)
 
 	// 3. 客户端测试
@@ -128,7 +130,8 @@ func BenchmarkUDPForwarding(b *testing.B) {
 	}()
 
 	// 2. 启动转发器
-	go startUDPBridge(ctx, localAddr, remoteAddr, "bench-udp")
+	mgr := NewManager(ctx)
+	go mgr.runUDP(localAddr, remoteAddr, "bench-udp")
 	time.Sleep(500 * time.Millisecond)
 
 	// 3. 客户端
