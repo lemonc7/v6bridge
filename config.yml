@@ -1,7 +1,7 @@
-example.com:
+192.168.8.35:
   - name: "幻兽帕鲁"
-    remote: 8211
-    local: 8211
-    proto: "udp"
+    remote: 52077
+    local: 52077
+    proto: "tcp"
 
 

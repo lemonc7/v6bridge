@@ -1,20 +1,23 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 // TunnelItem 代表单个隧道配置项
-// 使用简写字段名，与 config.yml 保持一致
 type TunnelItem struct {
 	Name   string `yaml:"name"`
 	Remote int    `yaml:"remote"`
@@ -22,32 +25,39 @@ type TunnelItem struct {
 	Proto  string `yaml:"proto"`
 }
 
-// Config 主要是 map[string][]TunnelItem
+// Config map[string][]TunnelItem
 // Key 是 Hostname
 type Config map[string][]TunnelItem
 
+var bufferPool = sync.Pool{
+	New: func() any {
+		// 每次池子中没有可用对象时，创建一个2KB的buffer(足够容纳绝大多数游戏包，MTU通常是1500)
+		return make([]byte, 2048)
+	},
+}
+
+// 确保放回池子的是完整容量的切片
+func putBack(b []byte) {
+	if b != nil {
+		bufferPool.Put(b[:cap(b)])
+	}
+}
+
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// 1. 尝试加载 config.yml
-	var config Config
 	configFile, err := os.ReadFile("config.yml")
 	if err != nil {
-		if os.IsNotExist(err) {
-			log.Fatalf("错误: 未找到配置文件 'config.yml'。请确保该文件存在于当前目录下。")
-		} else {
-			log.Fatalf("错误: 读取 'config.yml' 失败: %v", err)
-		}
+		log.Fatalf("[ERROR] 读取配置文件失败: %v\n", err)
 	}
 
 	// 2. 解析配置
+	var config Config
 	if err := yaml.Unmarshal(configFile, &config); err != nil {
-		log.Fatalf("错误: 解析 'config.yml' 失败 (格式不正确): %v", err)
+		log.Fatalf("[ERROR] 解析配置文件失败: %v\n", err)
 	}
-
-	if len(config) == 0 {
-		log.Fatalf("错误: 'config.yml' 内容为空或不包含任何有效的主机配置。")
-	}
-
-	fmt.Println("已从 config.yml 加载配置")
 
 	// 3. 并发运行所有隧道
 	var wg sync.WaitGroup
@@ -55,220 +65,275 @@ func main() {
 		for _, t := range tunnels {
 			// 检查端口范围 (1-65535)
 			if t.Local <= 0 || t.Local > 65535 || t.Remote <= 0 || t.Remote > 65535 {
-				log.Printf("警告: [%s] 跳过无效配置 (端口必须在 1-65535 之间) Host: %s, Local: %d, Remote: %d", t.Name, host, t.Local, t.Remote)
+				log.Printf("[WARN] (%s) 跳过无效配置 (端口必须在 1-65535 之间) Host: %s, Local: %d, Remote: %d\n", t.Name, host, t.Local, t.Remote)
 				continue
 			}
 
-			wg.Add(1)
-			go func(h string, p string, lp, rp int, n string) {
-				defer wg.Done()
-				if err := startTunnelService(h, p, lp, rp, n); err != nil {
-					log.Printf("启动隧道失败 [%s] %s:%d -> %s:%d: %v", n, p, lp, h, rp, err)
-				}
-			}(host, t.Proto, t.Local, t.Remote, t.Name)
+			wg.Go(func() {
+				startTunnelService(ctx, host, t)
+			})
 		}
 	}
-	wg.Wait()
+
+	// 等待退出信号
+	<-ctx.Done()
+	log.Println("[INFO] 正在下线所有隧道，请稍等...")
+
+	// 同步等待所有协程退出
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Println("[INFO] 资源清理完毕，安全退出")
+	case <-time.After(3 * time.Second):
+		log.Println("[WARN] 部分连接未在规定时间内关闭，强制结束")
+	}
 }
 
-func startTunnelService(host, protocol string, localPort, remotePort int, name string) error {
-	if protocol == "" {
-		protocol = "udp"
+func startTunnelService(ctx context.Context, host string, t TunnelItem) {
+	proto := strings.ToLower(t.Proto)
+	if proto == "" {
+		proto = "udp"
 	}
 
 	// 如果没有名字，生成一个
-	tunnelName := name
-	if tunnelName == "" {
-		tunnelName = fmt.Sprintf("%s-%d", protocol, localPort)
+	name := t.Name
+	if name == "" {
+		name = fmt.Sprintf("%s-%d", proto, t.Local)
 	}
 
-	localAddr := fmt.Sprintf(":%d", localPort)
-	remoteAddr := ""
+	localAddr := fmt.Sprintf(":%d", t.Local)
+	remoteAddr := net.JoinHostPort(host, strconv.Itoa(t.Remote))
 
-	// 1. 首先检查 Host 是否已经是 IP 地址
-	ip := net.ParseIP(host)
-	if ip != nil {
-		// 是直接的 IP 地址 (v4 或 v6)
-		if ip.To4() == nil {
-			// IPv6
-			remoteAddr = fmt.Sprintf("[%s]:%d", ip.String(), remotePort)
-			fmt.Printf("[%s] 使用直接配置的 IPv6 地址: %s\n", tunnelName, ip.String())
-		} else {
-			// IPv4
-			remoteAddr = fmt.Sprintf("%s:%d", ip.String(), remotePort)
-			fmt.Printf("[%s] 使用直接配置的 IPv4 地址: %s\n", tunnelName, ip.String())
-		}
+	if strings.ToLower(proto) == "tcp" {
+		startTCPBridge(ctx, localAddr, remoteAddr, name)
 	} else {
-		// 2. 是域名，进行解析
-		ips, err := net.LookupIP(host)
-		if err == nil {
-			var ipv6 net.IP
-			for _, resolveData := range ips {
-				if resolveData.To4() == nil {
-					ipv6 = resolveData
-					break
-				}
-			}
-			if ipv6 != nil {
-				remoteAddr = fmt.Sprintf("[%s]:%d", ipv6.String(), remotePort)
-				fmt.Printf("[%s] 已成功将 %s 解析为 %s\n", tunnelName, host, ipv6.String())
-			} else {
-				// 未解析到 V6，尝试回退到默认 (如 V4)
-				if len(ips) > 0 {
-					remoteAddr = fmt.Sprintf("%s:%d", ips[0].String(), remotePort)
-					fmt.Printf("[%s] 警告: %s 未解析到 IPv6，回退使用 IP: %s\n", tunnelName, host, ips[0].String())
-				} else {
-					remoteAddr = fmt.Sprintf("%s:%d", host, remotePort)
-				}
-			}
-		} else {
-			// 解析失败，按原样使用
-			remoteAddr = fmt.Sprintf("%s:%d", host, remotePort)
-			log.Printf("警告: [%s] 无法解析主机 '%s': %v。将按原样使用。", tunnelName, host, err)
-		}
-	}
-
-	runBridge(localAddr, remoteAddr, protocol, tunnelName)
-	return nil
-}
-
-func runBridge(localAddr, remoteAddr, protocol, name string) {
-	protocol = strings.ToLower(protocol)
-	if protocol != "tcp" && protocol != "udp" {
-		log.Printf("[%s] 无效协议: %s。必须是 tcp 或 udp。", name, protocol)
-		return
-	}
-
-	fmt.Printf("正在启动 %s 桥接 [%s]: %s -> %s\n", strings.ToUpper(protocol), name, localAddr, remoteAddr)
-
-	if protocol == "udp" {
-		startUDPBridge(localAddr, remoteAddr, name)
-	} else {
-		startTCPBridge(localAddr, remoteAddr, name)
+		startUDPBridge(ctx, localAddr, remoteAddr, name)
 	}
 }
 
-func startUDPBridge(local, remote, name string) {
+func startUDPBridge(ctx context.Context, local, remote, name string) {
+	// 解析本地UDP
 	lAddr, err := net.ResolveUDPAddr("udp", local)
 	if err != nil {
-		log.Printf("[%s] 解析本地地址 %s 失败: %v", name, local, err)
+		log.Printf("[ERROR] (%s) 解析本地地址 %s 失败: %v\n", name, local, err)
 		return
 	}
 
+	// 解析远程UDP
 	rAddr, err := net.ResolveUDPAddr("udp", remote)
 	if err != nil {
-		log.Printf("[%s] 解析远程地址 %s 失败: %v", name, remote, err)
+		log.Printf("[ERROR] (%s) 解析远程地址 %s 失败: %v\n", name, remote, err)
 		return
 	}
 
+	// 在本地UDP端口启动监听，准备接收数据包
 	conn, err := net.ListenUDP("udp", lAddr)
 	if err != nil {
-		log.Printf("[%s] 监听 %s 失败: %v", name, local, err)
+		log.Printf("[ERROR] (%s) 监听 %s 失败: %v\n", name, local, err)
 		return
 	}
-	defer conn.Close()
 
-	log.Printf("[%s] [UDP] 正在监听 %s 并转发至 %s\n", name, lAddr, rAddr)
+	// 游戏场景: 增加内核缓冲区，防止瞬时高频包丢失
+	if err := conn.SetReadBuffer(2 * 1024 * 1024); err != nil {
+		log.Printf("[WARN] (%s) 无法设置内核读缓冲区: %v\n", name, err)
+	}
+	_ = conn.SetWriteBuffer(2 * 1024 * 1024)
+
+	// 监听ctx，关闭监视器退出循环
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
 
 	sessions := make(map[string]*net.UDPConn)
-	var sessionsLock sync.Mutex
+	var sessionsLock sync.RWMutex
 
-	buf := make([]byte, 65535)
+	log.Printf("[INFO] (%s) [UDP] 隧道启动 %s -> %s\n", name, lAddr, rAddr)
 
 	for {
+		// 从池中获取buffer
+		buf := bufferPool.Get().([]byte)
+		// 设置读取超时，防止主循环异常卡死
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			log.Printf("[ERROR] (%s) 设置读取超时失败: %v\n", name, err)
+			putBack(buf)
+			break
+		}
+
 		n, cliAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("[%s] 读取 UDP 错误: %v", name, err)
-			continue
-		}
-
-		sessionsLock.Lock()
-		session, ok := sessions[cliAddr.String()]
-		if !ok {
-			rConn, err := net.DialUDP("udp", nil, rAddr)
-			if err != nil {
-				log.Printf("[%s] 连接远程主机失败: %v", name, err)
-				sessionsLock.Unlock()
+			// 没读到数据，立刻还回去
+			putBack(buf)
+			select {
+			case <-ctx.Done():
+				return //收到程序关闭通知，直接退出
+			default:
+				log.Printf("[WARN] (%s) 读取 UDP 错误: %v\n", name, err)
 				continue
 			}
-
-			session = rConn
-			sessions[cliAddr.String()] = session
-
-			go func(remoteConn *net.UDPConn, clientAddr *net.UDPAddr) {
-				defer remoteConn.Close()
-				defer func() {
-					sessionsLock.Lock()
-					delete(sessions, clientAddr.String())
-					sessionsLock.Unlock()
-				}()
-
-				respBuf := make([]byte, 65535)
-				for {
-					remoteConn.SetReadDeadline(time.Now().Add(5 * time.Minute))
-					rn, _, rErr := remoteConn.ReadFromUDP(respBuf)
-					if rErr != nil {
-						return
-					}
-					_, wErr := conn.WriteToUDP(respBuf[:rn], clientAddr)
-					if wErr != nil {
-						return
-					}
-				}
-			}(session, cliAddr)
 		}
-		sessionsLock.Unlock()
+
+		key := cliAddr.String()
+
+		// 找到或创建新的 Session
+		sessionsLock.RLock()
+		session, ok := sessions[key]
+		sessionsLock.RUnlock()
+
+		if !ok {
+			// 未找到，加写锁创建新会话
+			sessionsLock.Lock()
+			// 双重检查，防止并发冲突
+			if session, ok = sessions[key]; !ok {
+				rConn, err := net.DialUDP("udp", nil, rAddr)
+				if err != nil {
+					log.Printf("[ERROR] (%s) 连接远程主机失败: %v", name, err)
+					sessionsLock.Unlock()
+					putBack(buf)
+					continue
+				}
+				session = rConn
+				sessions[key] = session
+
+				// 启动异步协程处理回包 (Remote -> Local)
+				go func(remoteConn *net.UDPConn, clientAddr *net.UDPAddr, key string) {
+					defer remoteConn.Close()
+					defer func() {
+						sessionsLock.Lock()
+						delete(sessions, key)
+						sessionsLock.Unlock()
+					}()
+
+					// 从池中获取buffer
+					respBuf := bufferPool.Get().([]byte)
+					defer putBack(respBuf)
+
+					for {
+						_ = remoteConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+						rn, _, rErr := remoteConn.ReadFromUDP(respBuf)
+						if rErr != nil {
+							if err, ok := rErr.(net.Error); ok && err.Timeout() {
+								log.Printf("[INFO] (%s) 会话闲置超时已清理\n", name)
+							} else {
+								log.Printf("[WARN] (%s) 会话读取远程数据中断: %v\n", name, err)
+							}
+							return
+						}
+						// 写回数据给客户端
+						_, wErr := conn.WriteToUDP(respBuf[:rn], clientAddr)
+						if wErr != nil {
+							log.Printf("[WARN] (%s) 向客户端回包失败: %v\n", name, wErr)
+							return
+						}
+					}
+				}(session, cliAddr, key)
+			}
+			sessionsLock.Unlock()
+		}
 
 		_, err = session.Write(buf[:n])
+		// 用完了，放回池中
+		putBack(buf)
 		if err != nil {
-			log.Printf("[%s] 写入远程错误: %v", name, err)
+			log.Printf("[ERROR] (%s) 转发数据到远程失败: %v", name, err)
 		}
 	}
 }
 
-func startTCPBridge(local, remote, name string) {
+func startTCPBridge(ctx context.Context, local, remote, name string) {
 	lAddr, err := net.ResolveTCPAddr("tcp", local)
 	if err != nil {
-		log.Printf("[%s] 解析本地地址 %s 失败: %v", name, local, err)
-		return
-	}
-
-	rAddr, err := net.ResolveTCPAddr("tcp", remote)
-	if err != nil {
-		log.Printf("[%s] 解析远程地址 %s 失败: %v", name, remote, err)
+		log.Printf("[ERROR] (%s) 解析本地地址 %s 失败: %v", name, local, err)
 		return
 	}
 
 	listener, err := net.ListenTCP("tcp", lAddr)
 	if err != nil {
-		log.Printf("[%s] 监听 %s 失败: %v", name, local, err)
+		log.Printf("[ERROR] (%s) 监听 %s 失败: %v", name, local, err)
 		return
 	}
-	defer listener.Close()
 
-	log.Printf("[%s] [TCP] 正在监听 %s 并转发至 %s\n", name, lAddr, rAddr)
+	// 监听Ctx
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+
+	log.Printf("[INFO] (%s) [TCP] 隧道启动 %s -> %s\n", name, lAddr, remote)
 
 	for {
 		clientConn, err := listener.AcceptTCP()
 		if err != nil {
-			log.Printf("[%s] 接受连接错误: %v", name, err)
-			continue
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("[ERROR] [%s] 接受连接错误: %v", name, err)
+				continue
+			}
 		}
 
-		go handleTCPConnection(clientConn, rAddr, name)
+		// 设置TCP KeepAlive 检查死连接
+		_ = clientConn.SetKeepAlive(true)
+		_ = clientConn.SetKeepAlivePeriod(30 * time.Second)
+
+		go handleTCPConnection(ctx, clientConn, remote, name)
 	}
 }
 
-func handleTCPConnection(clientConn *net.TCPConn, remoteAddr *net.TCPAddr, name string) {
+func handleTCPConnection(ctx context.Context, clientConn *net.TCPConn, remoteAddr string, name string) {
 	defer clientConn.Close()
 
-	remoteConn, err := net.DialTCP("tcp", nil, remoteAddr)
+	// 使用带超时的Dialer
+	d := net.Dialer{Timeout: 10 * time.Second}
+	c, err := d.DialContext(ctx, "tcp", remoteAddr)
 	if err != nil {
-		log.Printf("[%s] 连接远程主机失败: %v", name, err)
+		log.Printf("[ERROR] (%s) 连接远程失败: %v", name, err)
 		return
 	}
+	remoteConn := c.(*net.TCPConn)
 	defer remoteConn.Close()
 
-	go io.Copy(remoteConn, clientConn)
-	io.Copy(clientConn, remoteConn)
+	_ = remoteConn.SetKeepAlive(true)
+	_ = remoteConn.SetKeepAlivePeriod(30 * time.Second)
+
+	var wg sync.WaitGroup
+	// Client -> Remote
+	wg.Go(func() {
+		_, err := io.Copy(remoteConn, clientConn)
+		if err != nil && err != io.EOF {
+			log.Printf("[WARN] (%s) 客户端->远程 数据流异常终止: %v\n", name, err)
+		}
+		// 告诉远程: 我发完了
+		remoteConn.CloseWrite()
+	})
+
+	// Remote -> Client
+	wg.Go(func() {
+		_, err := io.Copy(clientConn, remoteConn)
+		if err != nil && err != io.EOF {
+			log.Printf("[WARN] (%s) 远程->客户端 数据流异常终止: %v\n", name, err)
+		}
+		// 告诉客户端: 远程发完了
+		clientConn.CloseWrite()
+	})
+
+	// 阻塞等待直到拷贝结束或外部强制退出
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		log.Printf("[INFO] (%s) 系统退出，强制断开活跃的 TCP 连接\n", name)
+	case <-done:
+		// 正常退出
+	}
 }
