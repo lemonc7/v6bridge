@@ -43,25 +43,44 @@ func putBack(b []byte) {
 	}
 }
 
+type udpSession struct {
+	conn       *net.UDPConn
+	lastActive int64
+}
+
+type udpKey struct {
+	ip   [16]byte
+	port int
+}
+
+func newUDPKey(addr *net.UDPAddr) udpKey {
+	k := udpKey{port: addr.Port}
+	copy(k.ip[:], addr.IP.To16())
+	return k
+}
+
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM)
 	defer stop()
 
 	// 1. 尝试加载 config.yml
-	configFile, err := os.ReadFile("config.yml")
+	data, err := os.ReadFile("config.yml")
 	if err != nil {
 		log.Fatalf("[ERROR] 读取配置文件失败: %v\n", err)
 	}
 
 	// 2. 解析配置
-	var config Config
-	if err := yaml.Unmarshal(configFile, &config); err != nil {
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		log.Fatalf("[ERROR] 解析配置文件失败: %v\n", err)
 	}
 
 	// 3. 并发运行所有隧道
 	var wg sync.WaitGroup
-	for host, tunnels := range config {
+	for host, tunnels := range cfg {
 		for _, t := range tunnels {
 			// 检查端口范围 (1-65535)
 			if t.Local <= 0 || t.Local > 65535 || t.Remote <= 0 || t.Remote > 65535 {
@@ -77,7 +96,7 @@ func main() {
 
 	// 等待退出信号
 	<-ctx.Done()
-	log.Println("[INFO] 正在下线所有隧道，请稍等...")
+	log.Println("[INFO] 收到退出信号，正在释放资源...")
 
 	// 同步等待所有协程退出
 	done := make(chan struct{})
@@ -88,9 +107,9 @@ func main() {
 
 	select {
 	case <-done:
-		log.Println("[INFO] 资源清理完毕，安全退出")
+		log.Println("[INFO] 所有隧道已安全关闭")
 	case <-time.After(3 * time.Second):
-		log.Println("[WARN] 部分连接未在规定时间内关闭，强制结束")
+		log.Println("[WARN] 等待超时，强制退出")
 	}
 }
 
@@ -100,19 +119,18 @@ func startTunnelService(ctx context.Context, host string, t TunnelItem) {
 		proto = "udp"
 	}
 
-	// 如果没有名字，生成一个
 	name := t.Name
 	if name == "" {
 		name = fmt.Sprintf("%s-%d", proto, t.Local)
 	}
 
-	localAddr := fmt.Sprintf(":%d", t.Local)
-	remoteAddr := net.JoinHostPort(host, strconv.Itoa(t.Remote))
+	local := fmt.Sprintf(":%d", t.Local)
+	remote := net.JoinHostPort(host, strconv.Itoa(t.Remote))
 
-	if strings.ToLower(proto) == "tcp" {
-		startTCPBridge(ctx, localAddr, remoteAddr, name)
+	if proto == "tcp" {
+		startTCPBridge(ctx, local, remote, name)
 	} else {
-		startUDPBridge(ctx, localAddr, remoteAddr, name)
+		startUDPBridge(ctx, local, remote, name)
 	}
 }
 
@@ -138,110 +156,144 @@ func startUDPBridge(ctx context.Context, local, remote, name string) {
 		return
 	}
 
-	// 游戏场景: 增加内核缓冲区，防止瞬时高频包丢失
-	if err := conn.SetReadBuffer(2 * 1024 * 1024); err != nil {
-		log.Printf("[WARN] (%s) 无法设置内核读缓冲区: %v\n", name, err)
-	}
-	_ = conn.SetWriteBuffer(2 * 1024 * 1024)
-
-	// 监听ctx，关闭监视器退出循环
 	go func() {
 		<-ctx.Done()
 		_ = conn.Close()
 	}()
 
-	sessions := make(map[string]*net.UDPConn)
-	var sessionsLock sync.RWMutex
+	// 游戏场景: 增加内核缓冲区，防止瞬时高频包丢失
+	_ = conn.SetReadBuffer(2 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(2 * 1024 * 1024)
+
+	sessions := make(map[udpKey]*udpSession)
+	var mu sync.RWMutex
+
+	// 清理过期的 UDP 会话
+	go func() {
+		// 每隔30s检查一次
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				mu.Lock()
+				for _, s := range sessions {
+					s.conn.Close()
+				}
+				mu.Unlock()
+				return
+			case <-ticker.C:
+				now := time.Now().Unix()
+				mu.Lock()
+				for k, s := range sessions {
+					// 清理掉120s没活动的会话
+					if now-s.lastActive > 120 {
+						s.conn.Close()
+						delete(sessions, k)
+					}
+				}
+				mu.Unlock()
+			}
+		}
+	}()
 
 	log.Printf("[INFO] (%s) [UDP] 隧道启动 %s -> %s\n", name, lAddr, rAddr)
 
 	for {
 		// 从池中获取buffer
 		buf := bufferPool.Get().([]byte)
-		// 设置读取超时，防止主循环异常卡死
-		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-			log.Printf("[ERROR] (%s) 设置读取超时失败: %v\n", name, err)
-			putBack(buf)
-			break
-		}
-
 		n, cliAddr, err := conn.ReadFromUDP(buf)
+		fmt.Printf("[DEBUG] 收到数据包: %v -> 长度: %d\n", cliAddr, n)
 		if err != nil {
 			// 没读到数据，立刻还回去
 			putBack(buf)
-			select {
-			case <-ctx.Done():
-				return //收到程序关闭通知，直接退出
-			default:
-				log.Printf("[WARN] (%s) 读取 UDP 错误: %v\n", name, err)
-				continue
+			if ctx.Err() != nil {
+				return
 			}
+			continue
 		}
 
-		key := cliAddr.String()
-
+		key := newUDPKey(cliAddr)
 		// 找到或创建新的 Session
-		sessionsLock.RLock()
-		session, ok := sessions[key]
-		sessionsLock.RUnlock()
+		mu.RLock()
+		s, ok := sessions[key] // 检查是否已经为该客户端创建了远程连接
+		mu.RUnlock()
 
 		if !ok {
-			// 未找到，加写锁创建新会话
-			sessionsLock.Lock()
-			// 双重检查，防止并发冲突
-			if session, ok = sessions[key]; !ok {
-				rConn, err := net.DialUDP("udp", nil, rAddr)
-				if err != nil {
-					log.Printf("[ERROR] (%s) 连接远程主机失败: %v", name, err)
-					sessionsLock.Unlock()
-					putBack(buf)
-					continue
-				}
-				session = rConn
-				sessions[key] = session
-
-				// 启动异步协程处理回包 (Remote -> Local)
-				go func(remoteConn *net.UDPConn, clientAddr *net.UDPAddr, key string) {
-					defer remoteConn.Close()
-					defer func() {
-						sessionsLock.Lock()
-						delete(sessions, key)
-						sessionsLock.Unlock()
-					}()
-
-					// 从池中获取buffer
-					respBuf := bufferPool.Get().([]byte)
-					defer putBack(respBuf)
-
-					for {
-						_ = remoteConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
-						rn, _, rErr := remoteConn.ReadFromUDP(respBuf)
-						if rErr != nil {
-							if err, ok := rErr.(net.Error); ok && err.Timeout() {
-								log.Printf("[INFO] (%s) 会话闲置超时已清理\n", name)
-							} else {
-								log.Printf("[WARN] (%s) 会话读取远程数据中断: %v\n", name, err)
-							}
-							return
-						}
-						// 写回数据给客户端
-						_, wErr := conn.WriteToUDP(respBuf[:rn], clientAddr)
-						if wErr != nil {
-							log.Printf("[WARN] (%s) 向客户端回包失败: %v\n", name, wErr)
-							return
-						}
-					}
-				}(session, cliAddr, key)
+			// 未找到，创建新会话
+			rConn, err := net.DialUDP("udp", nil, rAddr)
+			if err != nil {
+				putBack(buf)
+				log.Printf("[WARN] (%s) 转发远程失败: %v", name, err)
+				continue
 			}
-			sessionsLock.Unlock()
-		}
+			s = &udpSession{
+				conn:       rConn,
+				lastActive: time.Now().Unix(),
+			}
+			mu.Lock()
+			sessions[key] = s
+			mu.Unlock()
 
-		_, err = session.Write(buf[:n])
+			// 启动反向回包协程
+			go udpReverseLoop(ctx, conn, cliAddr, key, s, sessions, &mu, name)
+		}
+		s.lastActive = time.Now().Unix()
+
+		_, _ = s.conn.Write(buf[:n])
 		// 用完了，放回池中
 		putBack(buf)
-		if err != nil {
-			log.Printf("[ERROR] (%s) 转发数据到远程失败: %v", name, err)
+	}
+}
+
+func udpReverseLoop(
+	ctx context.Context,
+	localConn *net.UDPConn,
+	clientAddr *net.UDPAddr,
+	key udpKey,
+	s *udpSession,
+	sessions map[udpKey]*udpSession,
+	mu *sync.RWMutex,
+	name string,
+) {
+	defer func() {
+		// 会话结束，关闭远程连接，并从map中移除
+		s.conn.Close()
+		mu.Lock()
+		delete(sessions, key)
+		mu.Unlock()
+		log.Printf("[INFO] (%s) 会话已销毁: %v", name, key)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
 		}
+
+		buf := bufferPool.Get().([]byte)
+		// 设置读取超时
+		_ = s.conn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		// 读取远程服务器返回客户端的包
+		rn, _, rErr := s.conn.ReadFromUDP(buf)
+		if rErr != nil {
+			putBack(buf)
+			if ctx.Err() != nil {
+				return
+			}
+			if err, ok := rErr.(net.Error); ok && err.Timeout() {
+				log.Printf("[INFO] (%s) 会话闲置超时已清理\n", name)
+			} else {
+				log.Printf("[WARN] (%s) 会话读取远程数据中断: %v\n", name, rErr)
+			}
+			return
+		}
+		s.lastActive = time.Now().Unix()
+		// 转发回客户端
+		_, _ = localConn.WriteToUDP(buf[:rn], clientAddr)
+		putBack(buf)
 	}
 }
 
@@ -269,38 +321,34 @@ func startTCPBridge(ctx context.Context, local, remote, name string) {
 	for {
 		clientConn, err := listener.AcceptTCP()
 		if err != nil {
-			select {
-			case <-ctx.Done():
+			if ctx.Err() != nil {
 				return
-			default:
-				log.Printf("[ERROR] [%s] 接受连接错误: %v", name, err)
-				continue
 			}
+			log.Printf("[WARN] [%s] 接受连接错误: %v", name, err)
+			continue
 		}
 
 		// 设置TCP KeepAlive 检查死连接
 		_ = clientConn.SetKeepAlive(true)
 		_ = clientConn.SetKeepAlivePeriod(30 * time.Second)
-
 		go handleTCPConnection(ctx, clientConn, remote, name)
 	}
 }
 
 func handleTCPConnection(ctx context.Context, clientConn *net.TCPConn, remoteAddr string, name string) {
 	defer clientConn.Close()
-
 	// 使用带超时的Dialer
-	d := net.Dialer{Timeout: 10 * time.Second}
+	d := net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
 	c, err := d.DialContext(ctx, "tcp", remoteAddr)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 连接远程失败: %v", name, err)
+		log.Printf("[ERROR] (%s) 远程连接失败: %v", name, err)
 		return
 	}
 	remoteConn := c.(*net.TCPConn)
 	defer remoteConn.Close()
-
-	_ = remoteConn.SetKeepAlive(true)
-	_ = remoteConn.SetKeepAlivePeriod(30 * time.Second)
 
 	var wg sync.WaitGroup
 	// Client -> Remote
