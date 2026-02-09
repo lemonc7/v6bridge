@@ -1,0 +1,37 @@
+# v6bridge
+
+v6bridge是一个端口映射工具，主要用于游戏联机(针对服务器只有公网ipv6，但是游戏只支持ipv4的场景)，可以将远程服务器的端口映射到本地，服务器ip支持ipv4/ipv6/域名格式，端口支持udp/tcp
+
+## Getting Start
+
+- 通过配置文件(config.yml)进行相关设置，配置文件需要放在程序同目录下
+- 配置参考:
+```yaml
+game.example.com:
+  - name: "mc"
+    remote: 25565
+    local: 25565
+    proto: "tcp"
+
+  - name: "帕鲁"
+    remote: 8211
+    local: 8211
+    proto: "udp"
+
+  - name: "teamspeak"
+    remote: 9987
+    local: 9987
+    proto: "udp"
+
+2001:db8:a0b:1234::100:
+  - name: "ipv6"
+    remote: 222
+    local: 333
+    proto: "udp"
+
+192.168.100.1:
+  - name: "ipv4"
+    remote: 444
+    local: 444
+    proto: "tcp"
+```

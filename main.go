@@ -60,6 +60,8 @@ func newUDPKey(addr *net.UDPAddr) udpKey {
 }
 
 func main() {
+	fmt.Println(">> v6bridge | 端口映射工具, 主要用于游戏ipv6联机 \n>> 详情参考 GitHub: https://github.com/lemonc7/v6bridge")
+	// 通过context实现优雅关闭
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
@@ -204,7 +206,6 @@ func startUDPBridge(ctx context.Context, local, remote, name string) {
 		// 从池中获取buffer
 		buf := bufferPool.Get().([]byte)
 		n, cliAddr, err := conn.ReadFromUDP(buf)
-		fmt.Printf("[DEBUG] 收到数据包: %v -> 长度: %d\n", cliAddr, n)
 		if err != nil {
 			// 没读到数据，立刻还回去
 			putBack(buf)
@@ -263,7 +264,6 @@ func udpReverseLoop(
 		mu.Lock()
 		delete(sessions, key)
 		mu.Unlock()
-		log.Printf("[INFO] (%s) 会话已销毁: %v", name, key)
 	}()
 
 	for {

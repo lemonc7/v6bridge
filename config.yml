@@ -1,5 +1,27 @@
-192.168.100.2:
-  - name: "test"
-    remote: 5666
-    local: 5666
+game.example.com:
+  - name: "mc"
+    remote: 25565
+    local: 25565
+    proto: "tcp"
+
+  - name: "帕鲁"
+    remote: 8211
+    local: 8211
+    proto: "udp"
+
+  - name: "teamspeak"
+    remote: 9987
+    local: 9987
+    proto: "udp"
+
+2001:db8:a0b:1234::100:
+  - name: "ipv6"
+    remote: 222
+    local: 333
+    proto: "udp"
+
+192.168.100.1:
+  - name: "ipv4"
+    remote: 444
+    local: 444
     proto: "tcp"
