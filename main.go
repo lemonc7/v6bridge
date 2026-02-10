@@ -23,7 +23,7 @@ import (
 const (
 	DefaultUDPTimeout = 120 * time.Second // 会话超时时间
 	CleanupInterval   = 30 * time.Second  // 清理间隔
-	BufferSize        = 32 * 1024         // 32KB: 兼顾低延迟与高吞吐
+	BufferSize        = 65535             // 64KB
 )
 
 // TunnelItem 单个隧道配置
@@ -313,6 +313,11 @@ func (m *Manager) runUDP(local, remote, name string) {
 							if m.isClosed(err) {
 								return
 							}
+							if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+								log.Printf("[INFO] (%s) UDP 会话长时间无数据，自动关闭", name)
+								return
+							}
+
 							log.Printf("[WARN] (%s) 会话异常中断: %v", name, err)
 							return
 						}
