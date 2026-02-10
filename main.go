@@ -31,6 +31,7 @@ type Setting struct {
 	CleanupInterval  int `yaml:"cleanup_interval"`
 	SocketBufSize    int `yaml:"socket_buf_size"`
 	PacketBufferSize int `yaml:"packet_buffer_size"`
+	ReportInterval   int `yaml:"report_interval"`
 }
 
 type TunnelGroup struct {
@@ -45,14 +46,29 @@ type ServiceItem struct {
 	Proto  string `yaml:"proto"`
 }
 
+type udpSession struct {
+	conn       *net.UDPConn
+	lastActive atomic.Int64
+}
+
+type ServiceStats struct {
+	Name      string
+	Proto     string
+	LocalPort int
+	Sent      atomic.Uint64
+	Recv      atomic.Uint64
+}
+
 // --- 核心管理器 ---
 type Manager struct {
 	ctx             context.Context
 	wg              sync.WaitGroup
 	sessionTimeout  time.Duration
 	cleanupInterval time.Duration
+	reportInterval  time.Duration
 	socketBufSize   int
 	bufferPool      sync.Pool
+	stats           []*ServiceStats
 }
 
 func NewManager(ctx context.Context, cfg Config) *Manager {
@@ -70,11 +86,15 @@ func NewManager(ctx context.Context, cfg Config) *Manager {
 	if s.PacketBufferSize <= 0 || s.PacketBufferSize > 64 {
 		s.PacketBufferSize = 64
 	}
+	if s.ReportInterval < 0 {
+		s.ReportInterval = 0
+	}
 
 	return &Manager{
 		ctx:             ctx,
 		sessionTimeout:  time.Duration(s.SessionTimeout) * time.Second,
 		cleanupInterval: time.Duration(s.CleanupInterval) * time.Second,
+		reportInterval:  time.Duration(s.ReportInterval) * time.Second,
 		socketBufSize:   s.SocketBufSize * 1024 * 1024,
 		bufferPool: sync.Pool{
 			New: func() any {
@@ -116,13 +136,26 @@ func (m *Manager) Start(cfg Config) {
 			local := fmt.Sprintf(":%d", t.Local)
 			remote := net.JoinHostPort(tunnel.Host, strconv.Itoa(t.Remote))
 
+			// 初始化统计对象
+			stat := &ServiceStats{
+				Name:      name,
+				Proto:     proto,
+				LocalPort: t.Local,
+			}
+			m.stats = append(m.stats, stat)
+
 			// 启动对应的桥接服务
 			if proto == "tcp" {
-				m.wg.Go(func() { m.runTCP(local, remote, name) })
+				m.wg.Go(func() { m.runTCP(local, remote, stat) })
 			} else {
-				m.wg.Go(func() { m.runUDP(local, remote, name) })
+				m.wg.Go(func() { m.runUDP(local, remote, stat) })
 			}
 		}
+	}
+
+	// 启动定期报告 (如果间隔 > 0)
+	if m.reportInterval > 0 {
+		m.wg.Go(func() { m.reportStats() })
 	}
 }
 
@@ -135,32 +168,34 @@ func (m *Manager) Wait() {
 
 	select {
 	case <-done:
+		m.printFinalStats()
 		log.Println("[INFO] 所有隧道已完成清理并退出")
 	case <-time.After(5 * time.Second):
+		m.printFinalStats()
 		log.Println("[WARN] 等待部分连接关闭超时，正在强制退出")
 	}
 }
 
-func (m *Manager) runTCP(local, remote, name string) {
+func (m *Manager) runTCP(local, remote string, stat *ServiceStats) {
 	lAddr, err := net.ResolveTCPAddr("tcp", local)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 本地地址解析失败: %v", name, err)
+		log.Printf("[ERROR] (%s) 本地地址解析失败: %v", stat.Name, err)
 		return
 	}
 
 	listener, err := net.ListenTCP("tcp", lAddr)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 监听失败: %v", name, err)
+		log.Printf("[ERROR] (%s) 监听失败: %v", stat.Name, err)
 		return
 	}
 	defer listener.Close()
 
-	go func() {
-		<-m.ctx.Done()
+	stop := context.AfterFunc(m.ctx, func() {
 		_ = listener.Close()
-	}()
+	})
+	defer stop()
 
-	log.Printf("[INFO] (%s) [TCP] 隧道已启动: %s -> %s", name, local, remote)
+	log.Printf("[INFO] (%s) [TCP] 隧道已启动: %s -> %s", stat.Name, local, remote)
 
 	for {
 		conn, err := listener.AcceptTCP()
@@ -168,16 +203,16 @@ func (m *Manager) runTCP(local, remote, name string) {
 			if m.isClosed(err) {
 				return
 			}
-			log.Printf("[WARN] (%s) 接受连接错误: %v", name, err)
+			log.Printf("[WARN] (%s) 接受连接错误: %v", stat.Name, err)
 			continue
 		}
 
 		// 追踪每个连接协程
-		m.wg.Go(func() { m.handleTCPConn(conn, remote, name) })
+		m.wg.Go(func() { m.handleTCPConn(conn, remote, stat) })
 	}
 }
 
-func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr, name string) {
+func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr string, stat *ServiceStats) {
 	defer clientConn.Close()
 	_ = clientConn.SetKeepAlive(true)
 	_ = clientConn.SetKeepAlivePeriod(30 * time.Second)
@@ -189,7 +224,7 @@ func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr, name string
 	}
 	c, err := d.DialContext(m.ctx, "tcp", remoteAddr)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 无法连接远程服务器: %v", name, err)
+		log.Printf("[ERROR] (%s) 无法连接远程服务器: %v", stat.Name, err)
 		return
 	}
 	remoteConn := c.(*net.TCPConn)
@@ -208,9 +243,11 @@ func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr, name string
 	go func() {
 		buf := m.getBuf()
 		defer m.putBuf(buf)
-		if _, err := io.CopyBuffer(remoteConn, clientConn, buf); err != nil {
+		// 客户端 -> 服务端 (发送)
+		cw := &countWriter{w: remoteConn, c: &stat.Sent}
+		if _, err := io.CopyBuffer(cw, clientConn, buf); err != nil {
 			if !m.isClosed(err) {
-				log.Printf("[WARN] (%s) 客户端->服务端 数据转发异常: %v", name, err)
+				log.Printf("[WARN] (%s) 客户端->服务端 数据转发异常: %v", stat.Name, err)
 			}
 		}
 		// 半关闭，告诉对方已经写完了
@@ -221,38 +258,35 @@ func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr, name string
 
 	buf := m.getBuf()
 	defer m.putBuf(buf)
-	if _, err := io.CopyBuffer(clientConn, remoteConn, buf); err != nil {
+	// 服务端 -> 客户端 (接收)
+	cw := &countWriter{w: clientConn, c: &stat.Recv}
+	if _, err := io.CopyBuffer(cw, remoteConn, buf); err != nil {
 		if !m.isClosed(err) {
-			log.Printf("[WARN] (%s) 服务端->客户端 数据转发异常: %v", name, err)
+			log.Printf("[WARN] (%s) 服务端->客户端 数据转发异常: %v", stat.Name, err)
 		}
 	}
 	// 半关闭，告诉对方已经写完了
-	_ = remoteConn.CloseWrite()
+	_ = clientConn.CloseWrite()
 
 	// 阻塞等两个进程运行结束
 	<-done
 }
 
-type udpSession struct {
-	conn       *net.UDPConn
-	lastActive atomic.Int64
-}
-
-func (m *Manager) runUDP(local, remote, name string) {
+func (m *Manager) runUDP(local, remote string, stat *ServiceStats) {
 	lAddr, err := net.ResolveUDPAddr("udp", local)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 本地地址解析失败: %v", name, err)
+		log.Printf("[ERROR] (%s) 本地地址解析失败: %v", stat.Name, err)
 		return
 	}
 	rAddr, err := net.ResolveUDPAddr("udp", remote)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 远程地址解析失败: %v", name, err)
+		log.Printf("[ERROR] (%s) 远程地址解析失败: %v", stat.Name, err)
 		return
 	}
 
 	conn, err := net.ListenUDP("udp", lAddr)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 监听失败: %v", name, err)
+		log.Printf("[ERROR] (%s) 监听失败: %v", stat.Name, err)
 		return
 	}
 	defer conn.Close()
@@ -272,10 +306,10 @@ func (m *Manager) runUDP(local, remote, name string) {
 
 	// 定期清理协程
 	m.wg.Go(func() {
-		m.sessionsCleanup(sessions, &mu)
+		m.sessionsCleanup(sessions, &mu, stat)
 	})
 
-	log.Printf("[INFO] (%s) [UDP] 隧道已启动: %s -> %s", name, local, remote)
+	log.Printf("[INFO] (%s) [UDP] 隧道已启动: %s -> %s", stat.Name, local, remote)
 
 	for {
 		buf := m.getBuf()
@@ -286,17 +320,18 @@ func (m *Manager) runUDP(local, remote, name string) {
 			if m.isClosed(err) {
 				return
 			}
-			log.Printf("[WARN] (%s) UDP读取错误: %v", name, err) // 增加日志防止静默失败
+			log.Printf("[WARN] (%s) UDP读取错误: %v", stat.Name, err) // 增加日志防止静默失败
 			continue
 		}
 
+		// 获取或创建会话
 		s := m.getOrCreateSession(
 			conn,
 			sessions,
 			&mu,
 			cliAddr,
 			rAddr,
-			name,
+			stat,
 		)
 		if s == nil {
 			m.putBuf(buf)
@@ -304,13 +339,21 @@ func (m *Manager) runUDP(local, remote, name string) {
 		}
 
 		s.lastActive.Store(time.Now().Unix())
-		// 将数据发给服务端
-		_, _ = s.conn.Write(buf[:n])
+		// 将数据发给服务端 (发送)
+		nWrite, err := s.conn.Write(buf[:n])
+		if nWrite > 0 {
+			stat.Sent.Add(uint64(nWrite))
+		}
+		if err != nil {
+			if !m.isClosed(err) {
+				log.Printf("[WARN] (%s) 转发UDP数据到服务端失败: %v", stat.Name, err)
+			}
+		}
 		m.putBuf(buf)
 	}
 }
 
-func (m *Manager) sessionsCleanup(sessions map[netip.AddrPort]*udpSession, mu *sync.RWMutex) {
+func (m *Manager) sessionsCleanup(sessions map[netip.AddrPort]*udpSession, mu *sync.RWMutex, stat *ServiceStats) {
 	ticker := time.NewTicker(m.cleanupInterval)
 	defer ticker.Stop()
 	for {
@@ -344,7 +387,7 @@ func (m *Manager) getOrCreateSession(
 	mu *sync.RWMutex,
 	cliAddr *net.UDPAddr,
 	rAddr *net.UDPAddr,
-	name string,
+	stat *ServiceStats,
 ) *udpSession {
 	key := cliAddr.AddrPort()
 
@@ -358,7 +401,7 @@ func (m *Manager) getOrCreateSession(
 
 	rConn, err := net.DialUDP("udp", nil, rAddr)
 	if err != nil {
-		log.Printf("[WARN] (%s) 无法创建远程UDP连接: %v", name, err)
+		log.Printf("[WARN] (%s) 无法创建远程UDP连接: %v", stat.Name, err)
 		return nil
 	}
 	_ = rConn.SetReadBuffer(m.socketBufSize)
@@ -375,9 +418,10 @@ func (m *Manager) getOrCreateSession(
 		s.lastActive.Store(time.Now().Unix())
 		sessions[key] = s
 	}
+	mu.Unlock()
 
 	m.wg.Go(func() {
-		m.proxyUDPBackwards(lConn, s, sessions, mu, key, name)
+		m.proxyUDPBackwards(lConn, s, sessions, mu, key, stat)
 	})
 
 	return s
@@ -389,7 +433,7 @@ func (m *Manager) proxyUDPBackwards(
 	sessions map[netip.AddrPort]*udpSession,
 	mu *sync.RWMutex,
 	key netip.AddrPort,
-	name string,
+	stat *ServiceStats,
 ) {
 	defer func() {
 		_ = s.conn.Close()
@@ -410,17 +454,25 @@ func (m *Manager) proxyUDPBackwards(
 				return
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("[INFO] (%s) UDP 会话长时间无数据，自动关闭", name)
+				log.Printf("[INFO] (%s) UDP 会话长时间无数据，自动关闭", stat.Name)
 				return
 			}
 
-			log.Printf("[WARN] (%s) 会话异常中断: %v", name, err)
+			log.Printf("[WARN] (%s) 会话异常中断: %v", stat.Name, err)
 			return
 		}
 
 		s.lastActive.Store(time.Now().Unix())
-		// 将数据发给本地客户端
-		_, _ = lConn.WriteToUDP(localBuf[:rn], net.UDPAddrFromAddrPort(key))
+		// 将数据发给本地客户端 (接收)
+		rnWrite, err := lConn.WriteToUDP(localBuf[:rn], net.UDPAddrFromAddrPort(key))
+		if rnWrite > 0 {
+			stat.Recv.Add(uint64(rnWrite))
+		}
+		if err != nil {
+			if !m.isClosed(err) {
+				log.Printf("[WARN] (%s) 转发UDP数据包到客户端失败: %v", stat.Name, err)
+			}
+		}
 	}
 }
 
@@ -432,6 +484,68 @@ func (m *Manager) isClosed(err error) bool {
 	return errors.Is(err, net.ErrClosed) ||
 		strings.Contains(err.Error(), "use of closed network connection") ||
 		m.ctx.Err() != nil
+}
+
+type countWriter struct {
+	w io.Writer
+	c *atomic.Uint64
+}
+
+func (cw *countWriter) Write(p []byte) (n int, err error) {
+	n, err = cw.w.Write(p)
+	cw.c.Add(uint64(n))
+	return
+}
+
+func (m *Manager) reportStats() {
+	ticker := time.NewTicker(m.reportInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			m.printStats()
+		}
+	}
+}
+
+func (m *Manager) printStats() {
+	now := time.Now().Format("15:04:05")
+	fmt.Printf("\n[%s] 实时流量报告:\n", now)
+	for _, s := range m.stats {
+		sent := formatBytes(s.Sent.Load())
+		recv := formatBytes(s.Recv.Load())
+		fmt.Printf("  • %-12s [%s:%d]  ↑ %-10s  ↓ %s\n", s.Name, strings.ToUpper(s.Proto), s.LocalPort, sent, recv)
+	}
+}
+
+func (m *Manager) printFinalStats() {
+	var totalSent, totalRecv uint64
+	fmt.Printf("\n[FINAL] 运行总结报告:\n")
+	for _, s := range m.stats {
+		sentVal := s.Sent.Load()
+		recvVal := s.Recv.Load()
+		totalSent += sentVal
+		totalRecv += recvVal
+		fmt.Printf("  - %-12s: 发送 %-10s 接收 %s\n", s.Name, formatBytes(sentVal), formatBytes(recvVal))
+	}
+	fmt.Printf("\n累计数据交换总量: ↑ %s  ↓ %s\n", formatBytes(totalSent), formatBytes(totalRecv))
+	fmt.Println("----------------------------------------------")
+}
+
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // --- 主要流程 ---
