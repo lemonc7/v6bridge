@@ -7,31 +7,47 @@ v6bridge是一个端口映射工具，主要用于游戏联机(针对服务器�
 - 通过配置文件(config.yml)进行相关设置，配置文件需要放在程序同目录下
 - 配置参考:
 ```yaml
-game.example.com:
-  - name: "mc"
-    remote: 25565
-    local: 25565
-    proto: "tcp"
+setting:
+  # UDP 会话超时时间（秒）。超过此时间没有数据交换，程序将自动断开连接以释放资源
+  session_timeout: 120
+  # 后台清理过期会话的频率（秒）。清理得越频繁，资源释放越及时，但会消耗微量 CPU
+  cleanup_interval: 30
+  # 系统底层套接字（Socket）缓冲区大小（MB）。在高并发或大带宽联机时，可以设置更大
+  socket_buf_size: 4
+  # 单次转发的内存缓冲区大小（KB）。最大 64KB
+  packet_buffer_size: 64
+  # 流量状态打印频率（秒）。设为 0 将完全关闭定时报告，只在退出时显示最终统计
+  report_interval: 60
 
-  - name: "帕鲁"
-    remote: 8211
-    local: 8211
-    proto: "udp"
+tunnels:
+  - host: "game.example.com"
+    services:
+      - name: "mc"
+        remote: 25565
+        local: 25565
+        proto: "tcp"
 
-  - name: "teamspeak"
-    remote: 9987
-    local: 9987
-    proto: "udp"
+      - name: "帕鲁"
+        remote: 8211
+        local: 8211
+        proto: "udp"
 
-2001:db8:a0b:1234::100:
-  - name: "ipv6"
-    remote: 222
-    local: 333
-    proto: "udp"
+      - name: "teamspeak"
+        remote: 9987
+        local: 9987
+        proto: "udp"
 
-192.168.100.1:
-  - name: "ipv4"
-    remote: 444
-    local: 444
-    proto: "tcp"
+  - host: "2001:db8:a0b:1234::100"
+    services:
+      - name: "ipv6"
+        remote: 222
+        local: 333
+        proto: "udp"
+
+  - host: "192.168.100.1"
+    services:
+      - name: "ipv4"
+        remote: 444
+        local: 444
+        proto: "tcp"
 ```
