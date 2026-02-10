@@ -64,7 +64,7 @@ func (m *Manager) Start(cfg Config) {
 	for host, tunnels := range cfg {
 		for _, t := range tunnels {
 			if t.Local <= 0 || t.Local > 65535 || t.Remote <= 0 || t.Remote > 65535 {
-				log.Printf("[WARN] (%s) 跳过无效端口配置: %s, Local: %d, Remote: %d\n", t.Name, host, t.Local, t.Remote)
+				log.Printf("[WARN] (%s) 跳过无效端口配置: %s, Local: %d, Remote: %d", t.Name, host, t.Local, t.Remote)
 				continue
 			}
 
@@ -106,7 +106,6 @@ func (m *Manager) Wait() {
 	}
 }
 
-// --- TCP 桥接实现 ---
 func (m *Manager) runTCP(local, remote, name string) {
 	lAddr, err := net.ResolveTCPAddr("tcp", local)
 	if err != nil {
@@ -119,13 +118,14 @@ func (m *Manager) runTCP(local, remote, name string) {
 		log.Printf("[ERROR] (%s) 监听失败: %v", name, err)
 		return
 	}
+	defer listener.Close()
 
 	go func() {
 		<-m.ctx.Done()
 		_ = listener.Close()
 	}()
 
-	log.Printf("[INFO] (%s) [TCP] 隧道已启动: %s -> %s\n", name, local, remote)
+	log.Printf("[INFO] (%s) [TCP] 隧道已启动: %s -> %s", name, local, remote)
 
 	for {
 		conn, err := listener.AcceptTCP()
@@ -137,10 +137,6 @@ func (m *Manager) runTCP(local, remote, name string) {
 			continue
 		}
 
-		_ = conn.SetKeepAlive(true)
-		_ = conn.SetKeepAlivePeriod(30 * time.Second)
-		_ = conn.SetNoDelay(true)
-
 		// 追踪每个连接协程
 		m.wg.Go(func() { m.handleTCPConn(conn, remote, name) })
 	}
@@ -148,16 +144,29 @@ func (m *Manager) runTCP(local, remote, name string) {
 
 func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr, name string) {
 	defer clientConn.Close()
+	_ = clientConn.SetKeepAlive(true)
+	_ = clientConn.SetKeepAlivePeriod(30 * time.Second)
+	_ = clientConn.SetNoDelay(true)
 
-	d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	d := net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
 	c, err := d.DialContext(m.ctx, "tcp", remoteAddr)
 	if err != nil {
 		log.Printf("[ERROR] (%s) 无法连接远程服务器: %v", name, err)
 		return
 	}
 	remoteConn := c.(*net.TCPConn)
-	_ = remoteConn.SetNoDelay(true)
 	defer remoteConn.Close()
+	_ = remoteConn.SetNoDelay(true)
+
+	// 监听关闭信号
+	go func() {
+		<-m.ctx.Done()
+		_ = clientConn.Close()
+		_ = remoteConn.Close()
+	}()
 
 	// 内部双向读写 WaitGroup
 	var internalWg sync.WaitGroup
@@ -166,29 +175,18 @@ func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr, name string
 		defer putBack(buf)
 		if _, err := io.CopyBuffer(dst, src, buf); err != nil {
 			if !m.isClosed(err) {
-				log.Printf("[WARN] (%s) %s 数据转发异常: %v\n", name, dir, err)
+				log.Printf("[WARN] (%s) %s 数据转发异常: %v", name, dir, err)
 			}
 		}
+		// 半关闭，告诉对方已经写完了
 		_ = dst.CloseWrite()
 	}
 
 	internalWg.Go(func() { transfer(remoteConn, clientConn, "客户端->服务端") })
 	internalWg.Go(func() { transfer(clientConn, remoteConn, "服务端->客户端") })
-
-	// 等待连接结束或 ctx 取消
-	done := make(chan struct{})
-	go func() {
-		internalWg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-m.ctx.Done():
-	case <-done:
-	}
+	internalWg.Wait()
 }
 
-// --- UDP 桥接实现 ---
 type udpSession struct {
 	conn       *net.UDPConn
 	lastActive atomic.Int64
@@ -253,43 +251,49 @@ func (m *Manager) runUDP(local, remote, name string) {
 		}
 	})
 
-	log.Printf("[INFO] (%s) [UDP] 隧道已启动: %s -> %s\n", name, local, remote)
+	log.Printf("[INFO] (%s) [UDP] 隧道已启动: %s -> %s", name, local, remote)
 
 	for {
 		buf := bufferPool.Get().([]byte)
+		// 读取本地客户端的数据包，准备转发给服务端
 		n, cliAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			putBack(buf)
 			if m.isClosed(err) {
 				return
 			}
+			log.Printf("[WARN] (%s) UDP读取错误: %v", name, err) // 增加日志防止静默失败
 			continue
 		}
 
-		// 使用 netip.AddrPort 提升性能
 		key := cliAddr.AddrPort()
+		// 第一次检查(读锁)，会话是否已存在
 		mu.RLock()
 		s, ok := sessions[key]
 		mu.RUnlock()
 
 		if !ok {
-			mu.Lock()
-			// 二次检查
-			if s, ok = sessions[key]; !ok {
-				rConn, err := net.DialUDP("udp", nil, rAddr)
-				if err != nil {
-					mu.Unlock()
-					putBack(buf)
-					log.Printf("[WARN] (%s) 无法创建远程UDP连接: %v", name, err)
-					continue
-				}
-				_ = rConn.SetReadBuffer(2 * 1024 * 1024)
-				_ = rConn.SetWriteBuffer(2 * 1024 * 1024)
+			rConn, err := net.DialUDP("udp", nil, rAddr)
+			if err != nil {
+				putBack(buf)
+				log.Printf("[WARN] (%s) 无法创建远程UDP连接: %v", name, err)
+				continue
+			}
+			_ = rConn.SetReadBuffer(2 * 1024 * 1024)
+			_ = rConn.SetWriteBuffer(2 * 1024 * 1024)
 
+			// 二次检查，防止并发创建(写锁)
+			mu.Lock()
+			if sExist, ok := sessions[key]; ok {
+				// 小概率并发冲突，使用已存在的，关闭新建的
+				_ = rConn.Close()
+				s = sExist
+			} else {
 				s = &udpSession{conn: rConn}
 				s.lastActive.Store(time.Now().Unix())
 				sessions[key] = s
-				// 启动反向回包协程
+
+				// 启动反向回包协程(将服务端返回的数据转发回本地客户端)
 				m.wg.Go(func() {
 					defer func() {
 						_ = s.conn.Close()
@@ -297,19 +301,25 @@ func (m *Manager) runUDP(local, remote, name string) {
 						delete(sessions, key)
 						mu.Unlock()
 					}()
+					// 复用buffer(同步串行是安全的)
+					localBuf := bufferPool.Get().([]byte)
+					defer putBack(localBuf)
 
 					for {
-						buf := bufferPool.Get().([]byte)
 						_ = s.conn.SetReadDeadline(time.Now().Add(DefaultUDPTimeout))
-						rn, err := s.conn.Read(buf)
+						// 从远程服务端读取数据
+						rn, err := s.conn.Read(localBuf)
 						if err != nil {
-							putBack(buf)
+							if m.isClosed(err) {
+								return
+							}
+							log.Printf("[WARN] (%s) 会话异常中断: %v", name, err)
 							return
 						}
 
 						s.lastActive.Store(time.Now().Unix())
-						_, _ = conn.WriteToUDP(buf[:rn], cliAddr)
-						putBack(buf)
+						// 将数据发给本地客户端
+						_, _ = conn.WriteToUDP(localBuf[:rn], net.UDPAddrFromAddrPort(key))
 					}
 				})
 			}
@@ -317,6 +327,7 @@ func (m *Manager) runUDP(local, remote, name string) {
 		}
 
 		s.lastActive.Store(time.Now().Unix())
+		// 将数据发给服务端
 		_, _ = s.conn.Write(buf[:n])
 		putBack(buf)
 	}
@@ -327,7 +338,9 @@ func (m *Manager) isClosed(err error) bool {
 	if err == nil {
 		return false
 	}
-	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed network connection") || m.ctx.Err() != nil
+	return errors.Is(err, net.ErrClosed) ||
+		strings.Contains(err.Error(), "use of closed network connection") ||
+		m.ctx.Err() != nil
 }
 
 // --- 主要流程 ---
@@ -343,12 +356,12 @@ func main() {
 
 	data, err := os.ReadFile("config.yml")
 	if err != nil {
-		log.Fatalf("[ERROR] 无法读取配置文件: %v\n", err)
+		log.Fatalf("[ERROR] 无法读取配置文件: %v", err)
 	}
 
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		log.Fatalf("[ERROR] 配置文件解析错误: %v\n", err)
+		log.Fatalf("[ERROR] 配置文件解析错误: %v", err)
 	}
 
 	mgr := NewManager(ctx)
