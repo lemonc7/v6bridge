@@ -59,7 +59,7 @@ type ServiceStats struct {
 	Recv      atomic.Uint64
 }
 
-// --- 核心管理器 ---
+// 核心管理器
 type Manager struct {
 	ctx             context.Context
 	wg              sync.WaitGroup
@@ -185,7 +185,7 @@ func (m *Manager) runTCP(local, remote string, stat *ServiceStats) {
 
 	listener, err := net.ListenTCP("tcp", lAddr)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 监听失败: %v", stat.Name, err)
+		log.Printf("[ERROR] (%s) TCP端口监听失败: %v", stat.Name, err)
 		return
 	}
 	defer listener.Close()
@@ -203,7 +203,7 @@ func (m *Manager) runTCP(local, remote string, stat *ServiceStats) {
 			if m.isClosed(err) {
 				return
 			}
-			log.Printf("[WARN] (%s) 接受连接错误: %v", stat.Name, err)
+			log.Printf("[WARN] (%s) 接受TCP连接错误: %v", stat.Name, err)
 			continue
 		}
 
@@ -224,7 +224,7 @@ func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr string, stat
 	}
 	c, err := d.DialContext(m.ctx, "tcp", remoteAddr)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 无法连接远程服务器: %v", stat.Name, err)
+		log.Printf("[ERROR] (%s) 无法连接远程TCP服务: %v", stat.Name, err)
 		return
 	}
 	remoteConn := c.(*net.TCPConn)
@@ -247,7 +247,7 @@ func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr string, stat
 		cw := &countWriter{w: remoteConn, c: &stat.Sent}
 		if _, err := io.CopyBuffer(cw, clientConn, buf); err != nil {
 			if !m.isClosed(err) {
-				log.Printf("[WARN] (%s) 客户端->服务端 数据转发异常: %v", stat.Name, err)
+				log.Printf("[WARN] (%s) 客户端->服务端: TCP数据转发异常: %v", stat.Name, err)
 			}
 		}
 		// 半关闭，告诉对方已经写完了
@@ -262,7 +262,7 @@ func (m *Manager) handleTCPConn(clientConn *net.TCPConn, remoteAddr string, stat
 	cw := &countWriter{w: clientConn, c: &stat.Recv}
 	if _, err := io.CopyBuffer(cw, remoteConn, buf); err != nil {
 		if !m.isClosed(err) {
-			log.Printf("[WARN] (%s) 服务端->客户端 数据转发异常: %v", stat.Name, err)
+			log.Printf("[WARN] (%s) 服务端->客户端: TCP数据转发异常: %v", stat.Name, err)
 		}
 	}
 	// 半关闭，告诉对方已经写完了
@@ -286,7 +286,7 @@ func (m *Manager) runUDP(local, remote string, stat *ServiceStats) {
 
 	conn, err := net.ListenUDP("udp", lAddr)
 	if err != nil {
-		log.Printf("[ERROR] (%s) 监听失败: %v", stat.Name, err)
+		log.Printf("[ERROR] (%s) UDP端口监听失败: %v", stat.Name, err)
 		return
 	}
 	defer conn.Close()
@@ -306,7 +306,7 @@ func (m *Manager) runUDP(local, remote string, stat *ServiceStats) {
 
 	// 定期清理协程
 	m.wg.Go(func() {
-		m.sessionsCleanup(sessions, &mu, stat)
+		m.sessionsCleanup(sessions, &mu)
 	})
 
 	log.Printf("[INFO] (%s) [UDP] 隧道已启动: %s -> %s", stat.Name, local, remote)
@@ -320,7 +320,7 @@ func (m *Manager) runUDP(local, remote string, stat *ServiceStats) {
 			if m.isClosed(err) {
 				return
 			}
-			log.Printf("[WARN] (%s) UDP读取错误: %v", stat.Name, err) // 增加日志防止静默失败
+			log.Printf("[WARN] (%s) 本地UDP数据读取失败: %v", stat.Name, err) // 增加日志防止静默失败
 			continue
 		}
 
@@ -353,7 +353,7 @@ func (m *Manager) runUDP(local, remote string, stat *ServiceStats) {
 	}
 }
 
-func (m *Manager) sessionsCleanup(sessions map[netip.AddrPort]*udpSession, mu *sync.RWMutex, stat *ServiceStats) {
+func (m *Manager) sessionsCleanup(sessions map[netip.AddrPort]*udpSession, mu *sync.RWMutex) {
 	ticker := time.NewTicker(m.cleanupInterval)
 	defer ticker.Stop()
 	for {
@@ -401,7 +401,7 @@ func (m *Manager) getOrCreateSession(
 
 	rConn, err := net.DialUDP("udp", nil, rAddr)
 	if err != nil {
-		log.Printf("[WARN] (%s) 无法创建远程UDP连接: %v", stat.Name, err)
+		log.Printf("[WARN] (%s) 无法连接远程UDP服务: %v", stat.Name, err)
 		return nil
 	}
 	_ = rConn.SetReadBuffer(m.socketBufSize)
@@ -454,11 +454,10 @@ func (m *Manager) proxyUDPBackwards(
 				return
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				log.Printf("[INFO] (%s) UDP 会话长时间无数据，自动关闭", stat.Name)
 				return
 			}
 
-			log.Printf("[WARN] (%s) 会话异常中断: %v", stat.Name, err)
+			log.Printf("[WARN] (%s) UDP侧(%d)异常中断: %v", stat.Name, key.Port(), err)
 			return
 		}
 
@@ -529,10 +528,9 @@ func (m *Manager) printFinalStats() {
 		recvVal := s.Recv.Load()
 		totalSent += sentVal
 		totalRecv += recvVal
-		fmt.Printf("  - %-12s: 发送 %-10s 接收 %s\n", s.Name, formatBytes(sentVal), formatBytes(recvVal))
+		fmt.Printf("  - %-12s: ↑ %-10s  ↓ %s\n", s.Name, formatBytes(sentVal), formatBytes(recvVal))
 	}
 	fmt.Printf("\n累计数据交换总量: ↑ %s  ↓ %s\n", formatBytes(totalSent), formatBytes(totalRecv))
-	fmt.Println("----------------------------------------------")
 }
 
 func formatBytes(b uint64) string {
