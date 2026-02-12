@@ -1,14 +1,12 @@
 setting:
   # UDP 会话超时时间（秒）。超过此时间没有数据交换，程序将自动断开连接以释放资源
   session_timeout: 120
-  # 后台清理过期会话的频率（秒）。清理得越频繁，资源释放越及时，但会消耗微量 CPU
-  cleanup_interval: 30
   # 系统底层套接字（Socket）缓冲区大小（MB）。在高并发或大带宽联机时，可以设置更大
   socket_buf_size: 4
   # 单次转发的内存缓冲区大小（KB）。最大 64KB
   packet_buffer_size: 64
   # 流量状态打印频率（秒）。设为 0 将完全关闭定时报告，只在退出时显示最终统计
-  report_interval: 60
+  report_interval: 300
 
 tunnels:
   - host: "game.example.com"

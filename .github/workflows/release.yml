@@ -22,9 +22,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Show Go Version
-        run: go version
-
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
