@@ -1,51 +1,24 @@
 # v6bridge
 
-v6bridge是一个端口映射工具，主要用于游戏联机(针对服务器只有公网ipv6，但是游戏只支持ipv4的场景)，可以将远程服务器的端口映射到本地，服务器ip支持ipv4/ipv6/域名格式，端口支持udp/tcp
+v6bridge 是一个端口映射工具，主要用于游戏联机(针对服务器只有公网 ipv6，但是游戏只支持 ipv4 的场景)，可以将远程服务器的端口映射到本地，服务器 ip 支持 ipv4/ipv6 和域名格式，端口支持 udp/tcp
 
 ## Getting Start
 
-- 通过配置文件(config.yml)进行相关设置，配置文件需要放在程序同目录下
+- 通过配置文件 (config.toml) 映射服务，配置文件需要放在程序同目录下
 - 配置参考:
-```yaml
-setting:
-  # UDP 会话超时时间（秒）。超过此时间没有数据交换，程序将自动断开连接以释放资源
-  session_timeout: 120
-  # 系统底层套接字（Socket）缓冲区大小（MB）。在高并发或大带宽联机时，可以设置更大
-  socket_buf_size: 4
-  # 单次转发的内存缓冲区大小（KB）。最大 64KB
-  packet_buffer_size: 64
-  # 流量状态打印频率（秒）。设为 0 将完全关闭定时报告，只在退出时显示最终统计
-  report_interval: 300
+```toml
+[[tunnels]]
+host = "example.com"
+services = [
+  { name = "mc", remote = 25565, local = 25565, proto = "tcp" },
+  { name = "帕鲁", remote = 8211, local = 8211, proto = "udp" },
+]
 
-tunnels:
-  - host: "game.example.com"
-    services:
-      - name: "mc"
-        remote: 25565
-        local: 25565
-        proto: "tcp"
+[[tunnels]]
+host = "192.168.100.1"
+services = [{ name = "v4", remote = 7000, local = 7000, proto = "both" }]
 
-      - name: "帕鲁"
-        remote: 8211
-        local: 8211
-        proto: "udp"
-
-      - name: "teamspeak"
-        remote: 9987
-        local: 9987
-        proto: "udp"
-
-  - host: "2001:db8:a0b:1234::100"
-    services:
-      - name: "ipv6"
-        remote: 222
-        local: 333
-        proto: "udp"
-
-  - host: "192.168.100.1"
-    services:
-      - name: "ipv4"
-        remote: 444
-        local: 444
-        proto: "tcp"
+[[tunnels]]
+host = "[240e::1]"
+services = [{ name = "v6", remote = 6000, local = 6000, proto = "both" }]
 ```

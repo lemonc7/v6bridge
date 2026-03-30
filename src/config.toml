@@ -1,0 +1,14 @@
+[[tunnels]]
+host = "example.com"
+services = [
+  { name = "mc", remote = 25565, local = 25565, proto = "tcp" },
+  { name = "帕鲁", remote = 8211, local = 8211, proto = "udp" },
+]
+
+[[tunnels]]
+host = "192.168.100.1"
+services = [{ name = "v4", remote = 8000, local = 8000, proto = "both" }]
+
+[[tunnels]]
+host = "[240e::1]"
+services = [{ name = "v6", remote = 9000, local = 9000, proto = "both" }]
