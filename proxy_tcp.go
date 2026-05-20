@@ -10,7 +10,15 @@ import (
 	"time"
 )
 
-func StartTCPProxy(ctx context.Context, logger *log.Logger, network NetworkConfig, name, local, remote string) {
+func StartTCPProxy(
+	ctx context.Context,
+	logger *log.Logger,
+	network NetworkConfig,
+	bufPool *BufferPool,
+	name string,
+	local string,
+	remote string,
+) {
 	localAddr, err := net.ResolveTCPAddr("tcp", local)
 	if err != nil {
 		logger.Printf("[ERROR] (%s) TCP 本地地址无效 (%s): %v", name, local, err)
@@ -45,11 +53,19 @@ func StartTCPProxy(ctx context.Context, logger *log.Logger, network NetworkConfi
 		}
 
 		logger.Printf("[INFO] (%s) 新 TCP 客户端连接: %s", name, client.RemoteAddr())
-		go handleTCPConn(ctx, logger, network, name, client, remote)
+		go handleTCPConn(ctx, logger, network, bufPool, name, client, remote)
 	}
 }
 
-func handleTCPConn(ctx context.Context, logger *log.Logger, network NetworkConfig, name string, client *net.TCPConn, remote string) {
+func handleTCPConn(
+	ctx context.Context,
+	logger *log.Logger,
+	network NetworkConfig,
+	bufPool *BufferPool,
+	name string,
+	client *net.TCPConn,
+	remote string,
+) {
 	defer client.Close()
 	setTCPOptions(client, network.BufferSize)
 
@@ -82,18 +98,20 @@ func handleTCPConn(ctx context.Context, logger *log.Logger, network NetworkConfi
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		pipeTCP(ctx, logger, network, name, "客户端->服务端", server, client)
+		pipeTCP(ctx, logger, bufPool, name, "客户端->服务端", server, client)
 	})
 	wg.Go(func() {
-		pipeTCP(ctx, logger, network, name, "服务端->客户端", client, server)
+		pipeTCP(ctx, logger, bufPool, name, "服务端->客户端", client, server)
 	})
 	wg.Wait()
 	logger.Printf("[INFO] (%s) TCP 连接结束: %s", name, client.RemoteAddr())
 }
 
 // 转发数据
-func pipeTCP(ctx context.Context, logger *log.Logger, network NetworkConfig, name, direction string, dst *net.TCPConn, src *net.TCPConn) {
-	buf := make([]byte, network.BufferSize)
+func pipeTCP(ctx context.Context, logger *log.Logger, bufPool *BufferPool, name, direction string, dst *net.TCPConn, src *net.TCPConn) {
+	bufp := bufPool.Get()
+	defer bufPool.Put(bufp)
+	buf := *bufp
 
 	if _, err := io.CopyBuffer(dst, src, buf); err != nil && !isClosed(ctx, err) {
 		logger.Printf("[WARN] (%s) %s TCP 数据转发异常: %v", name, direction, err)

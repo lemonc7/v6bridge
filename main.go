@@ -27,11 +27,7 @@ func main() {
 
 	logger.Println(">> v6bridge | 端口映射工具, 主要用于游戏 ipv6 联机")
 	logger.Println(">> 详情参考 GitHub: https://github.com/lemonc7/v6bridge")
-	logger.Printf(
-		"[INFO] 网络参数: session_timeout=%s, buffer_size=%d",
-		cfg.Network.SessionTimeout,
-		cfg.Network.BufferSize,
-	)
+	bufPool := NewBufferPool(cfg.Network.BufferSize)
 
 	var wg sync.WaitGroup
 	for _, tunnel := range cfg.Tunnels {
@@ -44,18 +40,18 @@ func main() {
 			switch svc.Proto {
 			case ProtocolTCP:
 				wg.Go(func() {
-					StartTCPProxy(ctx, logger, cfg.Network, svc.Name, localAddr, remoteAddr)
+					StartTCPProxy(ctx, logger, cfg.Network, bufPool, svc.Name, localAddr, remoteAddr)
 				})
 			case ProtocolUDP:
 				wg.Go(func() {
-					StartUDPProxy(ctx, logger, cfg.Network, svc.Name, localAddr, remoteAddr)
+					StartUDPProxy(ctx, logger, cfg.Network, bufPool, svc.Name, localAddr, remoteAddr)
 				})
 			case ProtocolBoth:
 				wg.Go(func() {
-					StartTCPProxy(ctx, logger, cfg.Network, svc.Name, localAddr, remoteAddr)
+					StartTCPProxy(ctx, logger, cfg.Network, bufPool, svc.Name, localAddr, remoteAddr)
 				})
 				wg.Go(func() {
-					StartUDPProxy(ctx, logger, cfg.Network, svc.Name, localAddr, remoteAddr)
+					StartUDPProxy(ctx, logger, cfg.Network, bufPool, svc.Name, localAddr, remoteAddr)
 				})
 			}
 		}

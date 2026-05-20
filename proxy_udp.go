@@ -10,7 +10,15 @@ import (
 	"time"
 )
 
-func StartUDPProxy(ctx context.Context, logger *log.Logger, network NetworkConfig, name, local, remote string) {
+func StartUDPProxy(
+	ctx context.Context,
+	logger *log.Logger,
+	network NetworkConfig,
+	bufPool *BufferPool,
+	name string,
+	local string,
+	remote string,
+) {
 	localAddr, err := net.ResolveUDPAddr("udp", local)
 	if err != nil {
 		logger.Printf("[ERROR] (%s) UDP 本地地址无效 (%s): %v", name, local, err)
@@ -42,13 +50,13 @@ func StartUDPProxy(ctx context.Context, logger *log.Logger, network NetworkConfi
 	})
 	defer stop()
 
-	log.Printf("[INFO] (%s) UDP 隧道已启动: %s -> %s", name, local, remote)
-
 	for {
-		buf := make([]byte, network.BufferSize)
+		bufp := bufPool.Get()
+		buf := *bufp
 		// 读取客户端发来的数据包，没有数据会阻塞
 		n, clientAddr, err := localConn.ReadFromUDP(buf)
 		if err != nil {
+			bufPool.Put(bufp)
 			if isClosed(ctx, err) {
 				return
 			}
@@ -56,8 +64,9 @@ func StartUDPProxy(ctx context.Context, logger *log.Logger, network NetworkConfi
 			continue
 		}
 
-		remoteConn := sessions.getOrCreate(ctx, logger, network, name, localConn, clientAddr, remoteAddr)
+		remoteConn := sessions.getOrCreate(ctx, logger, network, bufPool, name, localConn, clientAddr, remoteAddr)
 		if remoteConn == nil {
+			bufPool.Put(bufp)
 			continue
 		}
 
@@ -68,6 +77,7 @@ func StartUDPProxy(ctx context.Context, logger *log.Logger, network NetworkConfi
 		_, err = remoteConn.Write(buf[:n])
 		// 取消超时设置
 		_ = remoteConn.SetWriteDeadline(time.Time{})
+		bufPool.Put(bufp)
 
 		if err != nil && !isClosed(ctx, err) {
 			logger.Printf("[WARN] (%s) UDP 发送远程数据异常: %v", name, err)
@@ -88,6 +98,7 @@ func (s *udpSessions) getOrCreate(
 	ctx context.Context,
 	logger *log.Logger,
 	network NetworkConfig,
+	bufPool *BufferPool,
 	name string,
 	localConn *net.UDPConn,
 	clientAddr *net.UDPAddr,
@@ -124,7 +135,7 @@ func (s *udpSessions) getOrCreate(
 
 	logger.Printf("[INFO] (%s) 新 UDP 客户端连接: %s", name, clientAddr)
 	// 启动回传协程
-	go readUDPResponses(ctx, logger, network, name, localConn, remoteConn, key, s)
+	go readUDPResponses(ctx, logger, network, bufPool, name, localConn, remoteConn, key, s)
 
 	return remoteConn
 }
@@ -151,6 +162,7 @@ func readUDPResponses(
 	ctx context.Context,
 	logger *log.Logger,
 	network NetworkConfig,
+	bufPool *BufferPool,
 	name string,
 	localConn *net.UDPConn,
 	remoteConn *net.UDPConn,
@@ -163,7 +175,9 @@ func readUDPResponses(
 		logger.Printf("[INFO] (%s) UDP 会话已关闭: %s", name, clientKey)
 	}()
 
-	buf := make([]byte, network.BufferSize)
+	bufp := bufPool.Get()
+	defer bufPool.Put(bufp)
+	buf := *bufp
 	clientAddr := net.UDPAddrFromAddrPort(clientKey)
 	for {
 		// 设置读取超时时间，超过该时间没有收到数据包，则关闭连接
